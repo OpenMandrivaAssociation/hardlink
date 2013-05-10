@@ -1,11 +1,11 @@
 Summary:	Create a tree of hardlinks
 Name:		hardlink
-Version:	1.0
-Release:	%mkrel 13
 Epoch:		1
+Version:	1.0
+Release:	13
 Group:		System/Base 
-URL:		http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/hardlink/
-License:	GPL+
+License:	GPLv2
+Url:		http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/hardlink/
 Source0:	hardlink.c
 Source1:	hardlink.1
 Obsoletes:	kernel-utils
@@ -29,3 +29,4 @@ install -D -m 755 hardlink %{buildroot}%{_sbindir}/hardlink
 %files
 %{_sbindir}/hardlink
 %{_mandir}/man1/hardlink.1*
+
