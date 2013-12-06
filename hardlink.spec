@@ -2,7 +2,7 @@ Summary:	Create a tree of hardlinks
 Name:		hardlink
 Epoch:		1
 Version:	1.0
-Release:	14
+Release:	15
 Group:		System/Base 
 License:	GPLv2
 Url:		http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/hardlink/
