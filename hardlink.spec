@@ -22,7 +22,7 @@ amount of diskspace used by each kernel package installed.
 install -pm 644 %{SOURCE0} hardlink.c
 
 %build
-%{__cc} %{optflags} %{_ldflags} hardlink.c -o hardlink -lpcre2-8
+%{__cc} %{optflags} %{ldflags} hardlink.c -o hardlink -lpcre2-8
 
 %install
 install -D -m 644 %{SOURCE1} %{buildroot}%{_mandir}/man1/hardlink.1
