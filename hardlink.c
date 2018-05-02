@@ -12,17 +12,17 @@
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
    General Public License for more details.
 
-   You should have received a copy of the GNU General Public
-   License along with this program; see the file COPYING.  If not,
-   write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
-   Boston, MA 02111-1307, USA.  */
+   You should have received a copy of the GNU General Public License 
+   along with this program; if not, write to the Free Software Foundation, 
+   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA */
 
 /*  Changes by Rémy Card to use constants and add option -n.  */
-/*  Changes by Jindrich Novy to add option -h, replace mmap(2) */
-/*  Changes by Solar Designer to avoid buffer and integer overflows with deeply
- *  nested directories and/or long directory or file names. */
+/*  Changes by Jindrich Novy to add option -h, -f, replace mmap(2), fix overflows */
+/*  Changes by Travers Carter to make atomic hardlinking */
+/*  Changes by Todd Lewis that adds option -x to exclude files with pcre lib */
 
 #define _GNU_SOURCE
+#define PCRE2_CODE_UNIT_WIDTH 8
 #include <sys/types.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -32,11 +32,17 @@
 #include <string.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <pcre2.h>
 
 #define NHASH	(1<<17)	/* Must be a power of 2! */
 #define NIOBUF	(1<<12)
 #define NAMELEN	4096
 #define NBUF	64
+
+pcre2_code *re;
+PCRE2_SPTR exclude_pattern;
+pcre2_match_data *match_data;
 
 struct _f;
 typedef struct _h {
@@ -51,13 +57,14 @@ typedef struct _d {
   char name[0];
 } d;
 
-static d *dirs;
+d *dirs;
 
-static h *hps[NHASH];
+h *hps[NHASH];
 
-static int no_link = 0;
-static int verbose = 0;
-static int content_only = 0;
+int no_link = 0;
+int verbose = 0;
+int content_only = 0;
+int force = 0;
 
 typedef struct _f {
   struct _f *next;
@@ -67,12 +74,12 @@ typedef struct _f {
   char name[0];
 } f;
 
-static inline unsigned int hash(off_t size, time_t mtime)
+__attribute__((always_inline)) inline unsigned int hash(off_t size, time_t mtime)
 {
   return (size ^ mtime) & (NHASH - 1);
 }
 
-static inline int stcmp(struct stat *st1, struct stat *st2, int content_only)
+__attribute__((always_inline)) inline int stcmp(struct stat *st1, struct stat *st2, int content_only)
 {
   if (content_only)
     return st1->st_size != st2->st_size;
@@ -81,9 +88,9 @@ static inline int stcmp(struct stat *st1, struct stat *st2, int content_only)
          st1->st_mtime != st2->st_mtime;
 }
 
-static long long ndirs, nobjects, nregfiles, ncomp, nlinks, nsaved;
+long long ndirs, nobjects, nregfiles, ncomp, nlinks, nsaved;
 
-static void doexit(int i)
+void doexit(int i)
 {
   if (verbose) {
     fprintf(stderr, "\n\n");
@@ -97,21 +104,23 @@ static void doexit(int i)
   exit(i);
 }
 
-static void usage(char *prog)
+void usage(char *prog)
 {
-  fprintf (stderr, "Usage: %s [-cnvh] directories...\n", prog);
+  fprintf (stderr, "Usage: %s [-cnvhf] [-x pat] directories...\n", prog);
   fprintf (stderr, "  -c    When finding candidates for linking, compare only file contents.\n");
   fprintf (stderr, "  -n    Don't actually link anything, just report what would be done.\n");
   fprintf (stderr, "  -v    Print summary after hardlinking.\n");
   fprintf (stderr, "  -vv   Print every hardlinked file and bytes saved + summary.\n");
+  fprintf (stderr, "  -f    Force hardlinking across filesystems.\n");
+  fprintf (stderr, "  -x pat Exclude files matching pattern.\n");
   fprintf (stderr, "  -h    Show help.\n");
   exit(255);
 }
 
-static unsigned int buf[NBUF];
-static char iobuf1[NIOBUF], iobuf2[NIOBUF];
+unsigned int buf[NBUF];
+char iobuf1[NIOBUF], iobuf2[NIOBUF];
 
-static inline size_t add2(size_t a, size_t b)
+__attribute__((always_inline)) inline size_t add2(size_t a, size_t b)
 {
   size_t sum = a + b;
   if (sum < a) {
@@ -121,7 +130,7 @@ static inline size_t add2(size_t a, size_t b)
   return sum;
 }
 
-static inline size_t add3(size_t a, size_t b, size_t c)
+__attribute__((always_inline)) inline size_t add3(size_t a, size_t b, size_t c) 
 {
   return add2(add2(a, b), c);
 }
@@ -131,13 +140,7 @@ typedef struct {
   size_t alloc;
 } dynstr;
 
-static void initstr(dynstr *str)
-{
-  str->buf = NULL;
-  str->alloc = 0;
-}
-
-static void growstr(dynstr *str, size_t newlen)
+void growstr(dynstr *str, size_t newlen)
 {
   if (newlen < str->alloc)
     return;
@@ -147,16 +150,23 @@ static void growstr(dynstr *str, size_t newlen)
     doexit(4);
   }
 }
-
-static void rf (char *name)
+dev_t dev = 0;
+void rf (const char *name)
 {
   struct stat st, st2, st3;
+  const size_t namelen = strlen(name);
   nobjects++;
   if (lstat (name, &st))
     return;
+  if (st.st_dev != dev && !force) {
+    if (dev) {
+      fprintf(stderr, "%s is on different filesystem than the rest.\nUse -f option to override.\n", name);
+      doexit(6);
+    }
+    dev = st.st_dev;
+  }
   if (S_ISDIR (st.st_mode)) {
-    size_t namelen;
-    d * dp = malloc(add3(sizeof(d), namelen = strlen(name), 1));
+    d * dp = malloc(add3(sizeof(d), namelen, 1));
     if (!dp) {
       fprintf(stderr, "\nOut of memory 3\n");
       doexit(3);
@@ -168,7 +178,7 @@ static void rf (char *name)
     int fd, i;
     f * fp, * fp2;
     h * hp;
-    char *n1, *n2;
+    const char *n1, *n2;
     int cksumsize = sizeof(buf);
     unsigned int cksum;
     time_t mtime = content_only ? 0 : st.st_mtime;
@@ -177,7 +187,7 @@ static void rf (char *name)
     nregfiles++;
     if (verbose > 1)
       fprintf(stderr, "  %s", name);
-    fd = open (name, O_RDONLY | O_NOCTTY | O_NOFOLLOW);
+    fd = open (name, O_RDONLY);
     if (fd < 0) return;
     if (st.st_size < sizeof(buf)) {
       cksumsize = st.st_size;
@@ -185,11 +195,8 @@ static void rf (char *name)
     }
     if (read (fd, buf, cksumsize) != cksumsize) {
       close(fd);
-      if (verbose > 1) {
-        size_t namelen = strlen(name);
-        if (namelen <= NAMELEN)
-          fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
-      }
+      if (verbose > 1 && namelen <= NAMELEN)
+        fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
       return;
     }
     cksumsize = (cksumsize + sizeof(buf[0]) - 1) / sizeof(buf[0]);
@@ -220,11 +227,8 @@ static void rf (char *name)
     for (fp2 = fp; fp2 && fp2->cksum == cksum; fp2 = fp2->next)
       if (fp2->ino == st.st_ino && fp2->dev == st.st_dev) {
         close(fd);
-        if (verbose > 1) {
-          size_t namelen = strlen(name);
-          if (namelen <= NAMELEN)
-            fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
-        }
+        if (verbose > 1 && namelen <= NAMELEN)
+          fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
         return;
       }
     for (fp2 = fp; fp2 && fp2->cksum == cksum; fp2 = fp2->next)
@@ -232,19 +236,14 @@ static void rf (char *name)
           !stcmp (&st, &st2, content_only) &&
           st2.st_ino != st.st_ino &&
           st2.st_dev == st.st_dev) {
-        int fd2 = open (fp2->name, O_RDONLY | O_NOCTTY | O_NOFOLLOW);
+        int fd2 = open (fp2->name, O_RDONLY);
         if (fd2 < 0) continue;
         if (fstat (fd2, &st2) || !S_ISREG (st2.st_mode) || st2.st_size == 0) {
           close (fd2);
           continue;
         }
         ncomp++;
-	if (lseek(fd, 0, SEEK_SET)) {
-          close(fd);
-          close(fd2);
-          fprintf(stderr, "\nSeeking error\n");
-          return;
-        }
+	lseek(fd, 0, SEEK_SET);
 	for (fsize = st.st_size; fsize > 0; fsize -= NIOBUF) {
 	  off_t rsize = fsize >= NIOBUF ? NIOBUF : fsize;
 	  if (read (fd, iobuf1, rsize) != rsize || read (fd2, iobuf2, rsize) != rsize) {
@@ -274,72 +273,61 @@ static void rf (char *name)
           const char *suffix = ".$$$___cleanit___$$$";
           const size_t suffixlen = strlen(suffix);
           size_t n2len = strlen(n2);
-          dynstr nam2;
-          initstr(&nam2);
+          dynstr nam2 = {NULL, 0};
           growstr(&nam2, add2(n2len, suffixlen));
           memcpy(nam2.buf, n2, n2len);
           memcpy(&nam2.buf[n2len], suffix, suffixlen + 1);
-          if (rename (n2, nam2.buf)) {
-            fprintf(stderr, "\nFailed to rename %s to %s\n", n2, nam2.buf);
+          /* First create a temporary link to n1 under a new name */
+          if (link(n1, nam2.buf)) {
+            fprintf(stderr, "\nFailed to hardlink %s to %s (create temporary link as %s failed - %s)\n", n1, n2, nam2.buf, strerror(errno));
             free(nam2.buf);
             continue;
           }
-          if (link (n1, n2)) {
-            fprintf(stderr, "\nFailed to hardlink %s to %s\n", n1, n2);
-            if (rename (nam2.buf, n2)) {
-              fprintf(stderr, "\nBad bad - failed to rename back %s to %s\n", nam2.buf, n2);
+          /* Then rename into place over the existing n2 */
+          if (rename (nam2.buf, n2)) {
+            fprintf(stderr, "\nFailed to hardlink %s to %s (rename temporary link to %s failed - %s)\n", n1, n2, n2, strerror(errno));
+            /* Something went wrong, try to remove the now redundant temporary link */
+            if (unlink(nam2.buf)) {
+              fprintf(stderr, "\nFailed to remove temporary link %s - %s\n", nam2.buf, strerror(errno));
             }
-            close(fd);
             free(nam2.buf);
-            return;
+            continue;
           }
-          unlink (nam2.buf);
           free(nam2.buf);
         }
         nlinks++;
         if (st3.st_nlink > 1) {
 	  /* We actually did not save anything this time, since the link second argument
 	     had some other links as well.  */
-          if (verbose > 1) {
-            size_t namelen = strlen(name);
-            if (namelen > NAMELEN)
-              namelen = 0;
-            fprintf(stderr, "\r%*s\r%s %s to %s\n", (int)(namelen + 2), "", (no_link ? "Would link" : "Linked"), n1, n2);
-          }
+          if (verbose > 1)
+            fprintf(stderr, "\r%*s\r%s %s to %s\n", (int)(((namelen > NAMELEN) ? 0 : namelen) + 2), "", (no_link ? "Would link" : "Linked"), n1, n2);
         } else {
           nsaved+=((st.st_size+4095)/4096)*4096;
-          if (verbose > 1) {
-            size_t namelen = strlen(name);
-            if (namelen > NAMELEN)
-              namelen = 0;
-            fprintf(stderr, "\r%*s\r%s %s to %s, %s %ld\n", (int)(namelen + 2), "", (no_link ? "Would link" : "Linked"), n1, n2, (no_link ? "would save" : "saved"), st.st_size);
-          }
+          if (verbose > 1)
+            fprintf(stderr, "\r%*s\r%s %s to %s, %s %ld\n", (int)(((namelen > NAMELEN) ? 0 : namelen) + 2), "", (no_link ? "Would link" : "Linked"), n1, n2, (no_link ? "would save" : "saved"), st.st_size);
 	}
         close(fd);
         return;
       }
-    {
-      size_t namelen;
-      fp2 = malloc(add3(sizeof(f), namelen = strlen(name), 1));
-      if (!fp2) {
-        fprintf(stderr, "\nOut of memory 2\n");
-        doexit(2);
-      }
-      close(fd);
-      fp2->ino = st.st_ino;
-      fp2->dev = st.st_dev;
-      fp2->cksum = cksum;
-      memcpy(fp2->name, name, namelen + 1);
-      if (fp) {
-        fp2->next = fp->next;
-        fp->next = fp2;
-      } else {
-        fp2->next = hp->chain;
-        hp->chain = fp2;
-      }
-      if (verbose > 1 && namelen <= NAMELEN)
-        fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
+    fp2 = malloc(add3(sizeof(f), namelen, 1));
+    if (!fp2) {
+      fprintf(stderr, "\nOut of memory 2\n");
+      doexit(2);
     }
+    close(fd);
+    fp2->ino = st.st_ino;
+    fp2->dev = st.st_dev;
+    fp2->cksum = cksum;
+    memcpy(fp2->name, name, namelen + 1);
+    if (fp) {
+      fp2->next = fp->next;
+      fp->next = fp2;
+    } else {
+      fp2->next = hp->chain;
+      hp->chain = fp2;
+    }
+    if (verbose > 1 && namelen <= NAMELEN)
+      fprintf(stderr, "\r%*s\r", (int)(namelen + 2), "");
     return;
   }
 }
@@ -348,12 +336,10 @@ int main(int argc, char **argv)
 {
   int ch;
   int i;
-  dynstr nam1;
-  size_t nam1baselen;
-  d * dp;
-  DIR *dh;
-  struct dirent *di;
-  while ((ch = getopt (argc, argv, "cnvh")) != -1) {
+  int errornumber;
+  PCRE2_SIZE erroroffset;
+  dynstr nam1 = {NULL, 0};
+  while ((ch = getopt (argc, argv, "cnvhfx:")) != -1) {
     switch (ch) {
     case 'n':
       no_link++;
@@ -364,6 +350,12 @@ int main(int argc, char **argv)
     case 'c':
       content_only++;
       break;
+    case 'f':
+      force=1;
+      break;
+    case 'x':
+    	exclude_pattern = (PCRE2_SPTR)optarg;
+    	break;
     case 'h':
     default:
       usage(argv[0]);
@@ -371,13 +363,31 @@ int main(int argc, char **argv)
   }
   if (optind >= argc)
     usage(argv[0]);
+  if (exclude_pattern) {
+    re = pcre2_compile(
+          exclude_pattern,       /* the pattern */
+          PCRE2_ZERO_TERMINATED, /* indicates pattern is zero-terminate */
+          0,                     /* default options */
+          &errornumber,
+          &erroroffset,
+          NULL);                 /* use default compile context */
+    if (!re) {
+      PCRE2_UCHAR buffer[256];
+      pcre2_get_error_message(errornumber, buffer, sizeof(buffer));
+      fprintf(stderr, "pattern error at offset %d: %s\n", (int)erroroffset, buffer);
+      usage(argv[0]);
+    }
+    match_data = pcre2_match_data_create_from_pattern(re, NULL);
+  }
   for (i = optind; i < argc; i++)
     rf(argv[i]);
-  initstr(&nam1);
   while (dirs) {
-    dp = dirs;
+    DIR *dh;
+    struct dirent *di;
+    d * dp = dirs;
+    size_t nam1baselen = strlen(dp->name);
     dirs = dp->next;
-    growstr(&nam1, add2(nam1baselen = strlen(dp->name), 1));
+    growstr(&nam1, add2(nam1baselen, 1));
     memcpy(nam1.buf, dp->name, nam1baselen);
     free (dp);
     nam1.buf[nam1baselen++] = '/';
@@ -390,16 +400,23 @@ int main(int argc, char **argv)
       if (!di->d_name[0])
         continue;
       if (di->d_name[0] == '.') {
-        char *q;
-        if (!di->d_name[1] || !strcmp (di->d_name, "..") || !strncmp (di->d_name, ".in.", 4))
+        if (!di->d_name[1] || !strcmp(di->d_name, ".."))
           continue;
-        q = strrchr (di->d_name, '.');
-        if (q && strlen (q) == 7 && q != di->d_name) {
+      }
+      if (re && pcre2_match(
+                  re,                 /* compiled regex */
+                  (PCRE2_SPTR)di->d_name,
+                  strlen(di->d_name),
+                  0,                  /* start at offset 0 */
+                  0,                  /* default options */
+                  match_data,         /* block for storing the result */
+                  NULL)              /* use default match context */
+                        >= 0) {
+        if (verbose) {
           nam1.buf[nam1baselen] = 0;
-          if (verbose)
-            fprintf(stderr, "Skipping %s%s\n", nam1.buf, di->d_name);
-          continue;
+          fprintf(stderr,"Skipping %s%s\n", nam1.buf, di->d_name);
         }
+        continue; 
       }
       {
         size_t subdirlen;

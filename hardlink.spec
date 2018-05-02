@@ -1,14 +1,15 @@
 Summary:	Create a tree of hardlinks
 Name:		hardlink
 Epoch:		1
-Version:	1.0
-Release:	22
+Version:	1.3
+Release:	1
 Group:		System/Base
 License:	GPLv2
-Url:		http://cvsweb.openwall.com/cgi/cvsweb.cgi/Owl/packages/hardlink/
-Source0:	hardlink.c
-Source1:	hardlink.1
+Url:		https://pagure.io/hardlink
+Source0:	https://pagure.io/hardlink/raw/master/f/hardlink.c
+Source1:	https://pagure.io/hardlink/raw/master/f/hardlink.1
 BuildRequires:	clang
+BuildRequires:	pkgconfig(libpcre2-8)
 Obsoletes:	kernel-utils
 
 %description
@@ -21,7 +22,7 @@ amount of diskspace used by each kernel package installed.
 install -pm 644 %{SOURCE0} hardlink.c
 
 %build
-%{__cc} %{optflags} hardlink.c -o hardlink
+%{__cc} %{optflags} %{_ldflags} hardlink.c -o hardlink -lpcre2-8
 
 %install
 install -D -m 644 %{SOURCE1} %{buildroot}%{_mandir}/man1/hardlink.1
