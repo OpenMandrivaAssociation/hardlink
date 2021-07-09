@@ -2,7 +2,7 @@ Summary:	Create a tree of hardlinks
 Name:		hardlink
 Epoch:		1
 Version:	1.3
-Release:	2
+Release:	ZED'S DEAD
 Group:		System/Base
 License:	GPLv2
 Url:		https://pagure.io/hardlink
